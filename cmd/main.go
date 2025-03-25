@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -13,14 +14,48 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// ##################################
-// ###        SSH-TUNNELER        ###
-// ##################################
-
 type Endpoint struct {
-	Host string
-	Port int
-	User string
+	Host string `json:"host"`
+	Port int    `json:"port"`
+	User string `json:"user"`
+}
+
+type TunnelConfig struct {
+	Name     string   `json:"name"`
+	Server   Endpoint `json:"server"`
+	Local    Endpoint `json:"local"`
+	Remote   Endpoint `json:"remote"`
+	Key      string   `json:"key"`
+	Password string   `json:"password"`
+}
+
+const configFile = "tunnels.json"
+
+func (e *Endpoint) String() string {
+	return fmt.Sprintf("%s:%d", e.Host, e.Port)
+}
+
+func loadTunnels() ([]TunnelConfig, error) {
+	file, err := os.ReadFile(configFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []TunnelConfig{}, nil
+		}
+		return nil, err
+	}
+	var tunnels []TunnelConfig
+	if err := json.Unmarshal(file, &tunnels); err != nil {
+		return nil, err
+	}
+	return tunnels, nil
+}
+
+func saveTunnels(tunnels []TunnelConfig) error {
+	data, err := json.MarshalIndent(tunnels, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(configFile, data, 0644)
 }
 
 func NewEndpoint(h string) *Endpoint {
@@ -36,15 +71,7 @@ func NewEndpoint(h string) *Endpoint {
 		endpoint.Port, _ = strconv.Atoi(parts[1])
 	}
 
-	if endpoint.Port == 0 {
-		endpoint.Port = 22
-	}
-
 	return endpoint
-}
-
-func (e *Endpoint) String() string {
-	return fmt.Sprintf("%s:%d", e.Host, e.Port)
 }
 
 type SSHTunnel struct {
@@ -61,8 +88,7 @@ func (t *SSHTunnel) Start() error {
 	}
 	defer listener.Close()
 
-	t.Local.Port = listener.Addr().(*net.TCPAddr).Port
-	fmt.Printf("Listening on localhost:%d\n", t.Local.Port)
+	fmt.Printf("Listening on %s\n", t.Local.String())
 
 	for {
 		conn, err := listener.Accept()
@@ -88,72 +114,178 @@ func (t *SSHTunnel) forward(lc net.Conn) {
 	}
 	defer remoteConn.Close()
 
-	go io.Copy(lc, remoteConn)
-	go io.Copy(remoteConn, lc)
+	done := make(chan struct{}, 2)
+	go func() {
+		io.Copy(lc, remoteConn)
+		done <- struct{}{}
+	}()
+	go func() {
+		io.Copy(remoteConn, lc)
+		done <- struct{}{}
+	}()
+	<-done
 }
 
-func PrivateKeyFile(file string) ssh.AuthMethod {
+func PrivateKeyFile(file string) (ssh.AuthMethod, error) {
 	buffer, err := os.ReadFile(file)
 	if err != nil {
-		log.Fatalf("Failed to read private key file: %s", err)
+		return nil, fmt.Errorf("failed to read private key: %w", err)
 	}
 	key, err := ssh.ParsePrivateKey(buffer)
 	if err != nil {
-		log.Fatalf("Failed to parse private key: %s", err)
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
 	}
-	return ssh.PublicKeys(key)
+	return ssh.PublicKeys(key), nil
+}
+
+func startTunnel(t TunnelConfig) {
+	authMethods := make([]ssh.AuthMethod, 0)
+	if t.Key != "" {
+		keyAuth, err := PrivateKeyFile(t.Key)
+		if err != nil {
+			log.Fatalf("Failed to load private key: %v", err)
+		}
+		authMethods = append(authMethods, keyAuth)
+	}
+	if t.Password != "" {
+		authMethods = append(authMethods, ssh.Password(t.Password))
+	}
+
+	config := &ssh.ClientConfig{
+		User:            t.Server.User,
+		Auth:            authMethods,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+	}
+
+	tunnel := SSHTunnel{
+		Local:  &t.Local,
+		Server: &t.Server,
+		Remote: &t.Remote,
+		Config: config,
+	}
+
+	log.Printf("Starting tunnel: %s -> %s via %s", t.Local.String(), t.Remote.String(), t.Server.String())
+	if err := tunnel.Start(); err != nil {
+		log.Fatalf("Failed to start tunnel: %s", err)
+	}
 }
 
 func main() {
 	rootCmd := &cobra.Command{Use: "pocket"}
 
 	tunnelCmd := &cobra.Command{
-		Use:   "--tunnel",
+		Use:   "tunnel",
+		Short: "Manage SSH tunnels",
+	}
+
+	startCmd := &cobra.Command{
+		Use:   "start",
 		Short: "Start an SSH tunnel",
 		Run: func(cmd *cobra.Command, args []string) {
+			name, _ := cmd.Flags().GetString("name")
+			tunnels, err := loadTunnels()
+			if err != nil {
+				log.Fatalf("Error loading tunnels: %v", err)
+			}
+			for _, t := range tunnels {
+				if t.Name == name {
+					startTunnel(t)
+					return
+				}
+			}
+			log.Fatalf("Tunnel with name '%s' not found", name)
+		},
+	}
+	startCmd.Flags().String("name", "", "Name of the tunnel to start")
+	startCmd.MarkFlagRequired("name")
+
+	saveCmd := &cobra.Command{
+		Use:   "save",
+		Short: "Save an SSH tunnel configuration",
+		Run: func(cmd *cobra.Command, args []string) {
+			name, _ := cmd.Flags().GetString("name")
 			server, _ := cmd.Flags().GetString("server")
 			dest, _ := cmd.Flags().GetString("dest")
+			local, _ := cmd.Flags().GetString("local")
 			keyFile, _ := cmd.Flags().GetString("key")
 			password, _ := cmd.Flags().GetString("password")
 
-			if server == "" || dest == "" {
-				log.Fatal("Usage: pocket --tunnel --server user@host:port --dest host:port [--key path] [--password pass]")
-			}
-
-			var authMethod ssh.AuthMethod
-			if keyFile != "" {
-				authMethod = PrivateKeyFile(keyFile)
-			} else if password != "" {
-				authMethod = ssh.Password(password)
-			} else {
-				log.Fatal("Either private key or password must be provided")
-			}
-
 			serverEndpoint := NewEndpoint(server)
-
-			tunnel := &SSHTunnel{
-				Local:  NewEndpoint("localhost:0"),
-				Server: serverEndpoint,
-				Remote: NewEndpoint(dest),
-				Config: &ssh.ClientConfig{
-					User:            serverEndpoint.User,
-					Auth:            []ssh.AuthMethod{authMethod},
-					HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-				},
+			if serverEndpoint.Port == 0 {
+				serverEndpoint.Port = 22
 			}
 
-			log.Println("Starting SSH tunnel...")
-			if err := tunnel.Start(); err != nil {
-				log.Fatalf("Tunnel failed: %s", err)
+			remoteEndpoint := NewEndpoint(dest)
+			if remoteEndpoint.Port == 0 {
+				log.Fatal("Remote endpoint port must be specified")
+			}
+
+			localEndpoint := NewEndpoint(local)
+			if localEndpoint.Host == "" {
+				localEndpoint.Host = "localhost"
+			}
+
+			tunnel := TunnelConfig{
+				Name:     name,
+				Server:   *serverEndpoint,
+				Remote:   *remoteEndpoint,
+				Local:    *localEndpoint,
+				Key:      keyFile,
+				Password: password,
+			}
+
+			tunnels, err := loadTunnels()
+			if err != nil {
+				log.Fatalf("Error loading tunnels: %v", err)
+			}
+
+			// Check for existing tunnel with same name
+			for i, t := range tunnels {
+				if t.Name == name {
+					tunnels[i] = tunnel
+					if err := saveTunnels(tunnels); err != nil {
+						log.Fatalf("Failed to save tunnels: %v", err)
+					}
+					log.Println("Tunnel updated successfully")
+					return
+				}
+			}
+
+			tunnels = append(tunnels, tunnel)
+			if err := saveTunnels(tunnels); err != nil {
+				log.Fatalf("Failed to save tunnels: %v", err)
+			}
+			log.Println("Tunnel saved successfully")
+		},
+	}
+	saveCmd.Flags().String("name", "", "Name of the tunnel")
+	saveCmd.Flags().String("server", "", "SSH server address (user@host:port)")
+	saveCmd.Flags().String("dest", "", "Remote destination (host:port)")
+	saveCmd.Flags().String("local", "localhost:0", "Local endpoint (host:port)")
+	saveCmd.Flags().String("key", "", "Path to private key file")
+	saveCmd.Flags().String("password", "", "SSH password")
+	saveCmd.MarkFlagRequired("name")
+	saveCmd.MarkFlagRequired("server")
+	saveCmd.MarkFlagRequired("dest")
+
+	listCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List saved SSH tunnels",
+		Run: func(cmd *cobra.Command, args []string) {
+			tunnels, err := loadTunnels()
+			if err != nil {
+				log.Fatalf("Error loading tunnels: %v", err)
+			}
+			for _, t := range tunnels {
+				fmt.Printf("%s -> %s (via %s)\n", t.Name, t.Remote.String(), t.Server.String())
 			}
 		},
 	}
 
-	tunnelCmd.Flags().String("server", "", "SSH Server (user@host:port)")
-	tunnelCmd.Flags().String("dest", "", "Remote destination (host:port)")
-	tunnelCmd.Flags().String("key", "", "Path to private key file (optional)")
-	tunnelCmd.Flags().String("password", "", "SSH password (optional)")
-
+	tunnelCmd.AddCommand(startCmd, saveCmd, listCmd)
 	rootCmd.AddCommand(tunnelCmd)
-	rootCmd.Execute()
+
+	if err := rootCmd.Execute(); err != nil {
+		log.Fatal(err)
+	}
 }
